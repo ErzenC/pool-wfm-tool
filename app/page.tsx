@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import type { FormEvent } from "react";
+import { SessionGuard } from "@/components/auth/SessionGuard";
 import { kosovoCityCoordinates, type KosovoCity, type WeatherForecast } from "@/lib/weather";
 
 type Role = "admin" | "worker";
@@ -97,7 +98,12 @@ type AppState = {
 
 const STORAGE_KEY = "pool-wfm-state-v3";
 const SESSION_KEY = "pool-wfm-session-v3";
+const LOGOUT_EVENT_KEY = "pool-wfm-logout-event";
 const MAX_ACTIVE_WORKERS = 150;
+const shiftDetails: Record<ShiftNumber, { name: string; time: string }> = {
+  1: { name: "First Shift", time: "09:00 - 17:00" },
+  2: { name: "Second Shift", time: "10:00 - 18:00" },
+};
 
 const kosovoCities = Object.keys(kosovoCityCoordinates) as KosovoCity[];
 
@@ -191,6 +197,16 @@ function getNextFiveDays(startDate = getTodayIso()) {
   });
 }
 
+function getTodayAndNextFiveDays(startDate = getTodayIso()) {
+  const start = new Date(`${startDate}T00:00:00`);
+
+  return Array.from({ length: 6 }, (_, index) => {
+    const date = new Date(start);
+    date.setDate(start.getDate() + index);
+    return date.toISOString().slice(0, 10);
+  });
+}
+
 function getWorkersBySector(workers: Worker[], sectorId: string, activeOnly = false) {
   return workers.filter(
     (worker) => worker.sectorId === sectorId && (!activeOnly || worker.active),
@@ -216,7 +232,16 @@ function getAssignmentsForDateAndSector(
 }
 
 function getShiftLabel(shift: ShiftNumber) {
-  return shift === 1 ? "1st Shift" : "2nd Shift";
+  return shiftDetails[shift].name;
+}
+
+function getShiftTime(shift: ShiftNumber) {
+  return shiftDetails[shift].time;
+}
+
+function getShiftDisplay(shift: ShiftNumber) {
+  const details = shiftDetails[shift];
+  return `${details.name} (${details.time})`;
 }
 
 function formatScheduleDate(date: string) {
@@ -432,8 +457,24 @@ function saveJson<T>(key: string, value: T) {
   window.localStorage.setItem(key, JSON.stringify(value));
 }
 
+function loadSessionUsername() {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  return window.sessionStorage.getItem(SESSION_KEY);
+}
+
+function saveSessionUsername(username: string) {
+  window.sessionStorage.setItem(SESSION_KEY, username);
+}
+
+function clearSessionUiState() {
+  window.sessionStorage.removeItem(SESSION_KEY);
+}
+
 function loadSavedAccount() {
-  const username = loadJson<string | null>(SESSION_KEY, null);
+  const username = loadSessionUsername();
   if (!username) {
     return null;
   }
@@ -593,21 +634,33 @@ function EmptyState({ title, text }: { title: string; text: string }) {
   );
 }
 
-function LoginScreen({ onLogin }: { onLogin: (username: string, password: string) => string }) {
+function LoginScreen({ onLogin }: { onLogin: (username: string, password: string) => Promise<string> }) {
   const [username, setUsername] = useState("admin@poolwfm.local");
   const [password, setPassword] = useState("admin123");
-  const [error, setError] = useState("");
+  const [error, setError] = useState(() => {
+    if (typeof window === "undefined") {
+      return "";
+    }
 
-  function submitLogin(event: FormEvent<HTMLFormElement>) {
+    return new URLSearchParams(window.location.search).get("reason") === "session-expired"
+      ? "Sesioni juaj ka skaduar për shkak të joaktivitetit. Ju lutemi kyçuni përsëri."
+      : "";
+  });
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  async function submitLogin(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const result = onLogin(username.trim(), password);
+    setIsSubmitting(true);
+    const result = await onLogin(username.trim(), password);
 
     if (result) {
       setError(result);
+      setIsSubmitting(false);
       return;
     }
 
     setError("");
+    window.location.replace("/");
   }
 
   return (
@@ -641,9 +694,10 @@ function LoginScreen({ onLogin }: { onLogin: (username: string, password: string
           {error ? <p className="rounded-md bg-rose-50 p-3 text-sm text-rose-700">{error}</p> : null}
           <button
             type="submit"
+            disabled={isSubmitting}
             className="h-11 rounded-md bg-cyan-700 text-sm font-bold text-white transition hover:bg-cyan-800"
           >
-            Login
+            {isSubmitting ? "Logging in..." : "Login"}
           </button>
         </form>
         <div className="mt-5 grid gap-2 text-xs text-slate-500">
@@ -1419,22 +1473,24 @@ function StaffingView({
       </div>
 
       <section className="grid gap-3 sm:grid-cols-2">
-        <SummaryCard label="Shift 1 count" value={`${shift1Workers.length}`} />
-        <SummaryCard label="Shift 2 count" value={`${shift2Workers.length}`} />
+        <SummaryCard label={`${getShiftLabel(1)} count`} value={`${shift1Workers.length}`} note={getShiftTime(1)} />
+        <SummaryCard label={`${getShiftLabel(2)} count`} value={`${shift2Workers.length}`} note={getShiftTime(2)} />
       </section>
 
       <section className="grid gap-4 lg:grid-cols-2">
         <ShiftBox
-          title="1st Shift"
+          title={getShiftLabel(1)}
+          time={getShiftTime(1)}
           workers={shift1Workers}
-          emptyText="No workers assigned to Shift 1."
+          emptyText={`No workers assigned to ${getShiftLabel(1)}.`}
           className="border-green-200 bg-green-50"
           onRemove={onRemoveWorker}
         />
         <ShiftBox
-          title="2nd Shift"
+          title={getShiftLabel(2)}
+          time={getShiftTime(2)}
           workers={shift2Workers}
-          emptyText="No workers assigned to Shift 2."
+          emptyText={`No workers assigned to ${getShiftLabel(2)}.`}
           className="border-amber-200 bg-amber-50"
           onRemove={onRemoveWorker}
         />
@@ -1530,7 +1586,7 @@ function StaffingView({
                     </p>
                     {assignment ? (
                       <p className="mt-2 text-sm font-bold text-cyan-800">
-                        Assigned to {getShiftLabel(assignment.shift)}
+                        Assigned to {getShiftDisplay(assignment.shift)}
                       </p>
                     ) : null}
                   </div>
@@ -1543,7 +1599,7 @@ function StaffingView({
                           disabled={assignment.shift === 1}
                           className="h-10 rounded-md border border-green-300 bg-green-50 px-3 text-sm font-bold text-green-800 disabled:opacity-45"
                         >
-                          Move to 1
+                          First Shift
                         </button>
                         <button
                           type="button"
@@ -1551,7 +1607,7 @@ function StaffingView({
                           disabled={assignment.shift === 2}
                           className="h-10 rounded-md border border-amber-300 bg-amber-50 px-3 text-sm font-bold text-amber-800 disabled:opacity-45"
                         >
-                          Move to 2
+                          Second Shift
                         </button>
                         <button
                           type="button"
@@ -1568,14 +1624,14 @@ function StaffingView({
                           onClick={() => onAddWorker(worker.id, 1)}
                           className="h-10 rounded-md bg-green-700 px-3 text-sm font-bold text-white"
                         >
-                          Add 1
+                          First Shift
                         </button>
                         <button
                           type="button"
                           onClick={() => onAddWorker(worker.id, 2)}
                           className="h-10 rounded-md bg-amber-600 px-3 text-sm font-bold text-white"
                         >
-                          Add 2
+                          Second Shift
                         </button>
                       </>
                     )}
@@ -1592,12 +1648,14 @@ function StaffingView({
 
 function ShiftBox({
   title,
+  time,
   workers,
   emptyText,
   className,
   onRemove,
 }: {
   title: string;
+  time: string;
   workers: Worker[];
   emptyText: string;
   className: string;
@@ -1606,7 +1664,10 @@ function ShiftBox({
   return (
     <section className={`rounded-lg border p-4 shadow-sm ${className}`}>
       <div className="flex items-center justify-between">
-        <h2 className="text-lg font-bold">{title}</h2>
+        <div>
+          <h2 className="text-lg font-bold">{title}</h2>
+          <p className="mt-1 text-xs font-semibold text-slate-500">{time}</p>
+        </div>
         <span className="rounded-full bg-white px-3 py-1 text-xs font-bold text-slate-700">
           {workers.length}
         </span>
@@ -1866,15 +1927,18 @@ function WorkerClockPanel({
   worker,
   clockLogs,
   selectedDate,
+  todayAssignment,
   onWorkerClock,
 }: {
   worker: Worker;
   clockLogs: ClockLog[];
   selectedDate: string;
+  todayAssignment?: StaffingAssignment;
   onWorkerClock: (workerId: string, type: ClockLogType, actionDate: string) => Promise<string>;
 }) {
   const today = getTodayIso();
   const isTodaySelected = selectedDate === today;
+  const isScheduledToday = Boolean(todayAssignment);
   const permission = useClockPermission();
   const activeSession = getActiveClockSession(clockLogs, worker.id, today);
   const clockedOutToday = hasClockedOutToday(clockLogs, worker.id, today);
@@ -1882,8 +1946,8 @@ function WorkerClockPanel({
   const [message, setMessage] = useState("");
   const [isSaving, setIsSaving] = useState(false);
 
-  const canClockIn = isTodaySelected && permission.canClock && !activeSession && !clockedOutToday;
-  const canClockOut = isTodaySelected && permission.canClock && Boolean(activeSession);
+  const canClockIn = isTodaySelected && isScheduledToday && permission.canClock && !activeSession && !clockedOutToday;
+  const canClockOut = isTodaySelected && isScheduledToday && permission.canClock && Boolean(activeSession);
 
   async function submitClock(type: ClockLogType) {
     setIsSaving(true);
@@ -1908,6 +1972,13 @@ function WorkerClockPanel({
           </p>
           <h2 className="mt-2 text-xl font-bold">{getWorkerDisplayName(worker)}</h2>
           <p className="mt-1 text-sm text-slate-500">Today worked: {formatDuration(workedMinutes)}</p>
+          {todayAssignment ? (
+            <p className="mt-2 text-sm font-bold text-cyan-800">
+              Your current shift: {getShiftLabel(todayAssignment.shift)}, {getShiftTime(todayAssignment.shift)}
+            </p>
+          ) : (
+            <p className="mt-2 text-sm font-bold text-amber-700">You are not scheduled for today.</p>
+          )}
         </div>
         {activeSession ? (
           <span className="rounded-full bg-emerald-100 px-3 py-1 text-xs font-bold text-emerald-700">
@@ -1925,6 +1996,12 @@ function WorkerClockPanel({
       {isTodaySelected && !permission.canClock && !permission.isLoading ? (
         <p className="mt-4 rounded-md bg-amber-50 p-3 text-sm text-amber-800">
           Clock In/Out is available only from authorized Aqua Park networks.
+        </p>
+      ) : null}
+
+      {isTodaySelected && !isScheduledToday ? (
+        <p className="mt-4 rounded-md bg-amber-50 p-3 text-sm text-amber-800">
+          Clock In is available only when you are scheduled for today.
         </p>
       ) : null}
 
@@ -1977,8 +2054,7 @@ function WorkerView({
   onWorkerClock: (workerId: string, type: ClockLogType, actionDate: string) => Promise<string>;
 }) {
   const worker = state.workers.find((item) => item.id === account.workerId);
-  const days = getNextFiveDays();
-  const [selectedSectorId, setSelectedSectorId] = useState(worker?.sectorId ?? state.sectors[0]?.id ?? "");
+  const days = getTodayAndNextFiveDays();
   const [selectedDate, setSelectedDate] = useState(days[0] ?? getTodayIso());
   const weather = useWeatherForecast(state.selectedCity, selectedDate);
 
@@ -1986,14 +2062,15 @@ function WorkerView({
     return <EmptyState title="Worker not found" text="This mock worker account needs a worker record." />;
   }
 
+  const today = getTodayIso();
+  const todayAssignment = state.assignments.find(
+    (assignment) => assignment.workerId === worker.id && assignment.date === today,
+  );
+  const selectedAssignment = state.assignments.find(
+    (assignment) => assignment.workerId === worker.id && assignment.date === selectedDate,
+  );
+  const selectedSectorId = selectedAssignment?.sectorId ?? worker.sectorId;
   const sector = state.sectors.find((item) => item.id === selectedSectorId);
-  const assignments = getAssignmentsForDateAndSector(state.assignments, selectedDate, selectedSectorId);
-  const shift1Workers = state.workers.filter((item) =>
-    assignments.some((assignment) => assignment.workerId === item.id && assignment.shift === 1),
-  );
-  const shift2Workers = state.workers.filter((item) =>
-    assignments.some((assignment) => assignment.workerId === item.id && assignment.shift === 2),
-  );
 
   return (
     <section className="grid gap-4">
@@ -2001,24 +2078,11 @@ function WorkerView({
         worker={worker}
         clockLogs={state.clockLogs}
         selectedDate={selectedDate}
+        todayAssignment={todayAssignment}
         onWorkerClock={onWorkerClock}
       />
 
-      <section className="grid gap-3 rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:grid-cols-2">
-        <label className="flex flex-col gap-2 text-sm font-semibold text-slate-700">
-          Sector
-          <select
-            value={selectedSectorId}
-            onChange={(event) => setSelectedSectorId(event.target.value)}
-            className="h-11 rounded-md border border-slate-300 px-3 text-base outline-none focus:border-cyan-700"
-          >
-            {state.sectors.map((item) => (
-              <option key={item.id} value={item.id}>
-                {item.name}
-              </option>
-            ))}
-          </select>
-        </label>
+      <section className="grid gap-3 rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
         <label className="flex flex-col gap-2 text-sm font-semibold text-slate-700">
           Date
           <select
@@ -2047,45 +2111,59 @@ function WorkerView({
             {Math.round(weather.forecast.maxTemperature)}C
           </p>
         ) : null}
+        <div className="mt-4 grid gap-2 text-sm text-slate-600 sm:grid-cols-2">
+          <p>
+            <span className="font-semibold text-slate-800">Shift:</span>{" "}
+            {selectedAssignment ? getShiftLabel(selectedAssignment.shift) : "Not Scheduled"}
+          </p>
+          <p>
+            <span className="font-semibold text-slate-800">Time:</span>{" "}
+            {selectedAssignment ? getShiftTime(selectedAssignment.shift) : "-"}
+          </p>
+          <p>
+            <span className="font-semibold text-slate-800">Status:</span>{" "}
+            {selectedAssignment ? "Scheduled" : "Not Scheduled"}
+          </p>
+        </div>
       </article>
 
-      <section className="grid gap-4 lg:grid-cols-2">
-        <WorkerShiftViewer title="1st Shift" workers={shift1Workers} currentWorkerId={worker.id} />
-        <WorkerShiftViewer title="2nd Shift" workers={shift2Workers} currentWorkerId={worker.id} />
-      </section>
-    </section>
-  );
-}
+      <section className="grid gap-3">
+        <h2 className="text-lg font-bold">My schedule</h2>
+        <div className="grid gap-3 md:grid-cols-2">
+          {days.map((date) => {
+            const assignment = state.assignments.find(
+              (item) => item.workerId === worker.id && item.date === date,
+            );
+            const assignmentSectorId = assignment?.sectorId ?? worker.sectorId;
+            const assignmentSectorName = getSectorName(state.sectors, assignmentSectorId);
 
-function WorkerShiftViewer({
-  title,
-  workers,
-  currentWorkerId,
-}: {
-  title: string;
-  workers: Worker[];
-  currentWorkerId: string;
-}) {
-  return (
-    <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
-      <h2 className="text-lg font-bold">{title}</h2>
-      {workers.length ? (
-        <ul className="mt-4 grid gap-2">
-          {workers.map((worker) => (
-            <li key={worker.id} className="rounded-md bg-slate-50 p-3">
-              <p className="text-sm font-bold">
-                {getWorkerDisplayName(worker)}
-                {worker.id === currentWorkerId ? " - You" : ""}
-              </p>
-              <p className="mt-1 text-xs text-slate-500">{worker.jobTitle}</p>
-            </li>
-          ))}
-        </ul>
-      ) : (
-        <p className="mt-4 rounded-md bg-slate-50 p-3 text-sm text-slate-500">
-          No workers are assigned to this shift.
-        </p>
-      )}
+            return (
+              <article key={date} className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
+                <p className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">
+                  {formatScheduleDate(date)}
+                </p>
+                <h3 className="mt-2 text-lg font-bold">{assignmentSectorName}</h3>
+                <div className="mt-3 grid gap-2 text-sm text-slate-600">
+                  <p>
+                    <span className="font-semibold text-slate-800">Shift name:</span>{" "}
+                    {assignment ? getShiftLabel(assignment.shift) : "Not Scheduled"}
+                  </p>
+                  <p>
+                    <span className="font-semibold text-slate-800">Shift time:</span>{" "}
+                    {assignment ? getShiftTime(assignment.shift) : "-"}
+                  </p>
+                  <p>
+                    <span className="font-semibold text-slate-800">Status:</span>{" "}
+                    <span className={assignment ? "font-bold text-emerald-700" : "font-bold text-slate-500"}>
+                      {assignment ? "Scheduled" : "Not Scheduled"}
+                    </span>
+                  </p>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      </section>
     </section>
   );
 }
@@ -2114,14 +2192,33 @@ export default function Home() {
     }
   }, [mounted, state]);
 
-  function login(username: string, password: string) {
+  async function startSession(userId: string) {
+    const response = await fetch("/api/session/start", {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userId }),
+    });
+
+    if (!response.ok) {
+      throw new Error("Session could not be started.");
+    }
+  }
+
+  async function login(username: string, password: string) {
     const adminAccount = accounts.find(
       (item) => item.role === "admin" && item.username === username && item.password === password,
     );
 
     if (adminAccount) {
+      try {
+        await startSession(adminAccount.username);
+      } catch {
+        return "Unable to start a secure session. Please try again.";
+      }
+
       setAccount(adminAccount);
-      saveJson(SESSION_KEY, adminAccount.username);
+      saveSessionUsername(adminAccount.username);
       setActiveTab("dashboard");
       return "";
     }
@@ -2143,17 +2240,32 @@ export default function Home() {
       workerId: worker.id,
     };
 
+    try {
+      await startSession(worker.id);
+    } catch {
+      return "Unable to start a secure session. Please try again.";
+    }
+
     setAccount(workerAccount);
-    saveJson(SESSION_KEY, workerAccount.username);
+    saveSessionUsername(workerAccount.username);
     setActiveTab("worker");
     return "";
   }
 
-  function logout() {
+  async function logout() {
+    await fetch("/api/auth/logout", { method: "POST", cache: "no-store" }).catch(() => undefined);
     setAccount(null);
-    window.localStorage.removeItem(SESSION_KEY);
+    clearSessionUiState();
+    window.localStorage.setItem(LOGOUT_EVENT_KEY, String(Date.now()));
     setActiveTab("dashboard");
+    window.location.replace("/login");
   }
+
+  const expireClientSession = useCallback(() => {
+    setAccount(null);
+    clearSessionUiState();
+    setActiveTab("dashboard");
+  }, []);
 
   function addSector(name: string) {
     const baseId = slugify(name) || `sector-${Date.now()}`;
@@ -2326,6 +2438,14 @@ export default function Home() {
       throw new Error("Clock In/Out is only available for today.");
     }
 
+    const isScheduledToday = state.assignments.some(
+      (assignment) => assignment.workerId === workerId && assignment.date === today,
+    );
+
+    if (!isScheduledToday) {
+      throw new Error("Clock In/Out is available only when you are scheduled for today.");
+    }
+
     if (type === "CLOCK_IN") {
       if (getActiveClockSession(state.clockLogs, workerId, today)) {
         throw new Error("You are already clocked in.");
@@ -2349,6 +2469,7 @@ export default function Home() {
         actionDate,
         role: "worker",
         workerExists: Boolean(worker),
+        isScheduledToday,
       }),
     });
     const data = await response.json();
@@ -2462,6 +2583,10 @@ export default function Home() {
   return (
     <main className="min-h-screen bg-slate-50 text-slate-950">
       <div className="mx-auto flex w-full max-w-6xl flex-col gap-4 px-4 py-4 sm:px-6 lg:px-8">
+        <SessionGuard
+          userId={account.workerId ?? account.username}
+          onSessionExpired={expireClientSession}
+        />
         <AppHeader
           account={account}
           activeTab={activeTab}

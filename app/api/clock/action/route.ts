@@ -7,6 +7,7 @@ type ClockActionRequest = {
   actionDate?: string;
   role?: "worker" | "admin";
   workerExists?: boolean;
+  isScheduledToday?: boolean;
 };
 
 function getBusinessTodayIso() {
@@ -39,6 +40,13 @@ export async function POST(request: Request) {
   if (actionDate !== today) {
     return NextResponse.json(
       { error: "Clock In/Out is only available for today." },
+      { status: 400 },
+    );
+  }
+
+  if (!body.isScheduledToday) {
+    return NextResponse.json(
+      { error: "Clock In/Out is available only when you are scheduled for today." },
       { status: 400 },
     );
   }
