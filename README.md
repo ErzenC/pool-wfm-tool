@@ -12,7 +12,7 @@ Staffing remains manual. The app does not automatically recommend or assign work
 - Mock admin and worker login
 - localStorage persistence while Supabase is being prepared
 - Manual Shift 1 / Shift 2 assignment
-- Worker Clock In / Clock Out restricted by exact Aqua Park IPs
+- Worker Clock In / Clock Out restricted by public Aqua Park IP allowlist
 - Admin clock override and hours export
 - Real weather from Open-Meteo through `/api/weather`
 - Supabase schema, RLS, seed data, and client scaffolding
@@ -53,10 +53,19 @@ Weather is informational only. It does not assign workers or calculate required 
 
 ## Clocking
 
-Worker Clock In / Clock Out is allowed only from these exact IPs:
+Worker Clock In / Clock Out is allowed only from public IPs configured in Vercel:
 
-- `172.16.5.31`
-- `172.16.5.21`
+```bash
+CLOCK_ALLOWED_IPS=95.86.42.136
+```
+
+Multiple public IPs can be separated with commas:
+
+```bash
+CLOCK_ALLOWED_IPS=95.86.42.136,XX.XX.XX.XX
+```
+
+Do not use private/local production IPs such as `172.16.x.x`, `192.168.x.x`, or `10.x.x.x`.
 
 The IP check is performed server-side by:
 
@@ -67,6 +76,27 @@ Workers can view staffing and schedule information from anywhere, but clock butt
 
 Admins can manually Clock In or Clock Out assigned workers from anywhere. Admin-created events are marked with `ADMIN_OVERRIDE` and include an audit tooltip in the Hours module.
 
+Admins can manage allowed public IPs from **Clock Network / Allowed IPs**. If the admin-managed list has active IPs, worker clocking uses that list. If the list is empty, worker clocking falls back to `CLOCK_ALLOWED_IPS` from Vercel.
+
+## Vercel Launch Setup
+
+Add this Environment Variable in Vercel, then redeploy the app:
+
+```bash
+CLOCK_ALLOWED_IPS=95.86.42.136
+```
+
+Live testing:
+
+1. Connect to Aqua Park Wi-Fi.
+2. Open `https://api.ipify.org`.
+3. Confirm the public IP is `95.86.42.136`.
+4. Open the live app.
+5. Login as worker.
+6. Try Clock In.
+7. If blocked, login as admin and open Settings.
+8. Check Admin Network Debug to compare Detected IP vs Allowed IPs and forwarded headers.
+
 ## Supabase Setup
 
 Copy `.env.example` to `.env.local`:
@@ -75,6 +105,7 @@ Copy `.env.example` to `.env.local`:
 NEXT_PUBLIC_SUPABASE_URL=
 NEXT_PUBLIC_SUPABASE_ANON_KEY=
 SUPABASE_SERVICE_ROLE_KEY=
+CLOCK_ALLOWED_IPS=95.86.42.136
 ```
 
 Never expose `SUPABASE_SERVICE_ROLE_KEY` in browser code.
@@ -115,7 +146,7 @@ Shift assignment records store worker IDs, not worker names.
 
 1. Login as worker: `2026001` / `diar123`.
 2. Confirm staffing and sector schedule are visible from anywhere.
-3. Confirm Clock In / Clock Out is only allowed from `172.16.5.31` or `172.16.5.21`.
+3. Confirm Clock In / Clock Out is only allowed when the detected public IP matches `CLOCK_ALLOWED_IPS`.
 4. Clock In as worker from an allowed IP.
 5. Clock Out as worker.
 6. Confirm the worker cannot clock in again after clocking out.

@@ -14,7 +14,7 @@ type DemandLevel =
   | "Weak weather"
   | "Rain / Cold";
 type Rating = 1 | 2 | 3 | 4 | 5;
-type Tab = "dashboard" | "sectors" | "workers" | "staffing" | "hours" | "settings" | "worker";
+type Tab = "dashboard" | "sectors" | "workers" | "staffing" | "hours" | "clock-network" | "settings" | "worker";
 type ShiftNumber = 1 | 2;
 type ClockLogType = "CLOCK_IN" | "CLOCK_OUT";
 type ClockSource = "WORKER" | "ADMIN_OVERRIDE";
@@ -58,6 +58,15 @@ type ClockLog = {
   ipAddress: string | null;
 };
 
+type AllowedClockIp = {
+  id: string;
+  ipAddress: string;
+  locationName: string;
+  isActive: boolean;
+  createdAt: string;
+  createdBy: string;
+};
+
 type WorkerForm = Omit<Worker, "id"> & {
   temporaryPassword: string;
 };
@@ -83,6 +92,7 @@ type AppState = {
   selectedCity: string;
   assignments: Assignments;
   clockLogs: ClockLog[];
+  allowedClockIps: AllowedClockIp[];
 };
 
 const STORAGE_KEY = "pool-wfm-state-v3";
@@ -164,6 +174,7 @@ const initialState: AppState = {
     { id: "a-06", date: getNextFiveDays()[1], sectorId: "restaurant", workerId: "w-15", shift: 2 },
   ],
   clockLogs: [],
+  allowedClockIps: [],
 };
 
 function getTodayIso() {
@@ -325,6 +336,17 @@ function buildClockTimestamp(date: string, time: string) {
   return new Date(`${date}T${time}:00`).toISOString();
 }
 
+function getActiveAllowedClockIps(allowedClockIps: AllowedClockIp[]) {
+  return allowedClockIps
+    .filter((item) => item.isActive)
+    .map((item) => item.ipAddress.trim())
+    .filter(Boolean);
+}
+
+function normalizeClientIp(ip: string) {
+  return ip === "::1" || ip === "::ffff:127.0.0.1" ? "127.0.0.1" : ip;
+}
+
 function loadJson<T>(key: string, fallback: T): T {
   if (typeof window === "undefined") {
     return fallback;
@@ -418,6 +440,7 @@ function migrateAppState(saved: AppState): AppState {
     selectedCity: saved.selectedCity ?? initialState.selectedCity,
     assignments: migrateAssignments(saved.assignments),
     clockLogs: saved.clockLogs ?? initialState.clockLogs,
+    allowedClockIps: saved.allowedClockIps ?? initialState.allowedClockIps,
   };
 }
 
@@ -530,7 +553,8 @@ function useWeatherForecast(city: string, date: string) {
   return { forecast, isLoading, error };
 }
 
-function useClockPermission() {
+function useClockPermission(allowedClockIps: string[] = []) {
+  const allowedClockIpsKey = allowedClockIps.join(",");
   const [canClock, setCanClock] = useState(false);
   const [detectedIp, setDetectedIp] = useState<string | null>(null);
   const [clockAccess, setClockAccess] = useState<"allowed" | "blocked">("blocked");
@@ -556,9 +580,19 @@ function useClockPermission() {
           return;
         }
 
-        setCanClock(data.canClock);
+        const normalizedDetectedIp = data.detectedIp ? normalizeClientIp(data.detectedIp) : null;
+        const normalizedAllowedIps = allowedClockIpsKey
+          .split(",")
+          .map((ip) => normalizeClientIp(ip.trim()))
+          .filter(Boolean);
+        const isAllowedByLocalList =
+          normalizedDetectedIp && normalizedAllowedIps.length > 0
+            ? normalizedAllowedIps.includes(normalizedDetectedIp)
+            : data.canClock;
+
+        setCanClock(Boolean(isAllowedByLocalList));
         setDetectedIp(data.detectedIp);
-        setClockAccess(data.clockAccess ?? (data.canClock ? "allowed" : "blocked"));
+        setClockAccess(isAllowedByLocalList ? "allowed" : (data.clockAccess ?? "blocked"));
       })
       .finally(() => {
         if (active) {
@@ -570,9 +604,41 @@ function useClockPermission() {
       active = false;
       window.clearTimeout(loadingTimer);
     };
-  }, []);
+  }, [allowedClockIpsKey]);
 
   return { canClock, detectedIp, clockAccess, isLoading };
+}
+
+type ClockNetworkDebug = {
+  canClock: boolean;
+  detectedIp: string | null;
+  allowedIps: string[];
+  clockAccess: "allowed" | "blocked";
+  headers: {
+    "cf-connecting-ip": string | null;
+    "x-real-ip": string | null;
+    "x-forwarded-for": string | null;
+  };
+};
+
+function useClockNetworkDebug() {
+  const [debug, setDebug] = useState<ClockNetworkDebug | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+
+  function refresh() {
+    setIsLoading(true);
+    fetch("/api/clock/status", { cache: "no-store" })
+      .then((response) => response.json())
+      .then((data: ClockNetworkDebug) => setDebug(data))
+      .finally(() => setIsLoading(false));
+  }
+
+  useEffect(() => {
+    const timer = window.setTimeout(refresh, 0);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  return { debug, isLoading, refresh };
 }
 
 function slugify(value: string) {
@@ -696,6 +762,7 @@ function AppHeader({
           { id: "workers" as Tab, label: "Workers" },
           { id: "staffing" as Tab, label: "Staffing" },
           { id: "hours" as Tab, label: "Hours" },
+          { id: "clock-network" as Tab, label: "Clock Network" },
           { id: "settings" as Tab, label: "Settings" },
         ]
       : [{ id: "worker" as Tab, label: "My schedule" }];
@@ -1665,14 +1732,245 @@ function ShiftBox({
   );
 }
 
+function ClockNetworkView({
+  allowedClockIps,
+  createdBy,
+  onAddAllowedIp,
+  onToggleAllowedIp,
+  onDeleteAllowedIp,
+}: {
+  allowedClockIps: AllowedClockIp[];
+  createdBy: string;
+  onAddAllowedIp: (ipAddress: string, locationName: string) => boolean;
+  onToggleAllowedIp: (id: string) => void;
+  onDeleteAllowedIp: (id: string) => void;
+}) {
+  const networkDebug = useClockNetworkDebug();
+  const [ipAddress, setIpAddress] = useState("");
+  const [locationName, setLocationName] = useState("");
+  const [currentLocationName, setCurrentLocationName] = useState("");
+  const activeCount = allowedClockIps.filter((item) => item.isActive).length;
+  const activeAllowedIps = getActiveAllowedClockIps(allowedClockIps);
+  const detectedIp = networkDebug.debug?.detectedIp ? normalizeClientIp(networkDebug.debug.detectedIp) : null;
+  const clockAccess =
+    detectedIp && activeAllowedIps.length > 0
+      ? activeAllowedIps.map(normalizeClientIp).includes(detectedIp)
+      : networkDebug.debug?.clockAccess === "allowed";
+
+  function submitAllowedIp(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (onAddAllowedIp(ipAddress, locationName)) {
+      setIpAddress("");
+      setLocationName("");
+    }
+  }
+
+  function addCurrentDetectedIp() {
+    const detectedIp = networkDebug.debug?.detectedIp;
+
+    if (!detectedIp) {
+      window.alert("Detected IP is not available yet.");
+      return;
+    }
+
+    if (!currentLocationName.trim()) {
+      window.alert("Enter a location name first.");
+      return;
+    }
+
+    if (onAddAllowedIp(detectedIp, currentLocationName)) {
+      setCurrentLocationName("");
+    }
+  }
+
+  return (
+    <section className="grid gap-4">
+      <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <h2 className="text-lg font-bold">Clock Network / Allowed IPs</h2>
+            <p className="mt-1 text-sm text-slate-500">
+              Workers can clock in or out only from active public IPs in this list.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={networkDebug.refresh}
+            className="h-10 rounded-md border border-cyan-700 px-4 text-sm font-bold text-cyan-800"
+          >
+            {networkDebug.isLoading ? "Checking..." : "Refresh IP"}
+          </button>
+        </div>
+        <div className="mt-4 grid gap-3 sm:grid-cols-3">
+          <SummaryCard label="Current detected public IP" value={networkDebug.debug?.detectedIp ?? "Not detected"} />
+          <SummaryCard label="Active allowed IPs" value={activeCount.toString()} />
+          <SummaryCard
+            label="Clock access"
+            value={clockAccess ? "Allowed" : "Blocked"}
+          />
+        </div>
+      </section>
+
+      <section className="grid gap-4 lg:grid-cols-2">
+        <form className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm" onSubmit={submitAllowedIp}>
+          <h3 className="text-lg font-bold">Add allowed IP</h3>
+          <div className="mt-3 grid gap-3">
+            <label className="flex flex-col gap-2 text-sm font-semibold text-slate-700">
+              IP Address
+              <input
+                value={ipAddress}
+                onChange={(event) => setIpAddress(event.target.value)}
+                placeholder="95.86.42.136"
+                className="h-11 rounded-md border border-slate-300 px-3 text-base outline-none focus:border-cyan-700"
+              />
+            </label>
+            <label className="flex flex-col gap-2 text-sm font-semibold text-slate-700">
+              Location name
+              <input
+                value={locationName}
+                onChange={(event) => setLocationName(event.target.value)}
+                placeholder="Aqua Park Main Wi-Fi"
+                className="h-11 rounded-md border border-slate-300 px-3 text-base outline-none focus:border-cyan-700"
+              />
+            </label>
+            <button type="submit" className="h-11 rounded-md bg-cyan-700 px-4 text-sm font-bold text-white">
+              Add
+            </button>
+          </div>
+        </form>
+
+        <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
+          <h3 className="text-lg font-bold">Add current detected IP</h3>
+          <p className="mt-1 text-sm text-slate-500">
+            Detected IP: {networkDebug.debug?.detectedIp ?? "Not detected"}
+          </p>
+          <div className="mt-3 grid gap-3">
+            <label className="flex flex-col gap-2 text-sm font-semibold text-slate-700">
+              Location name
+              <input
+                value={currentLocationName}
+                onChange={(event) => setCurrentLocationName(event.target.value)}
+                placeholder="Aqua Park Main Wi-Fi"
+                className="h-11 rounded-md border border-slate-300 px-3 text-base outline-none focus:border-cyan-700"
+              />
+            </label>
+            <button
+              type="button"
+              onClick={addCurrentDetectedIp}
+              className="h-11 rounded-md bg-cyan-700 px-4 text-sm font-bold text-white"
+            >
+              Add current detected IP
+            </button>
+          </div>
+        </section>
+      </section>
+
+      <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
+        <h3 className="text-lg font-bold">Allowed IP list</h3>
+        {allowedClockIps.length ? (
+          <ul className="mt-4 grid gap-2">
+            {allowedClockIps.map((item) => (
+              <li key={item.id} className="rounded-lg border border-slate-200 p-3">
+                <div className="grid gap-3 md:grid-cols-[1fr_140px_170px_210px] md:items-center">
+                  <div>
+                    <p className="text-sm font-bold">{item.ipAddress}</p>
+                    <p className="mt-1 text-xs text-slate-500">{item.locationName}</p>
+                    <p className="mt-1 text-xs text-slate-500">
+                      Created {new Date(item.createdAt).toLocaleDateString()} by {item.createdBy || createdBy}
+                    </p>
+                  </div>
+                  <span
+                    className={`w-fit rounded-full px-3 py-1 text-xs font-bold ${
+                      item.isActive ? "bg-emerald-100 text-emerald-700" : "bg-slate-100 text-slate-600"
+                    }`}
+                  >
+                    {item.isActive ? "Active" : "Inactive"}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => onToggleAllowedIp(item.id)}
+                    className="h-10 rounded-md border border-cyan-700 px-3 text-sm font-bold text-cyan-800"
+                  >
+                    {item.isActive ? "Disable" : "Enable"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onDeleteAllowedIp(item.id)}
+                    className="h-10 rounded-md border border-rose-200 bg-rose-50 px-3 text-sm font-bold text-rose-700"
+                  >
+                    Delete
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <EmptyState
+            title="No allowed IPs yet"
+            text="Clocking will fall back to CLOCK_ALLOWED_IPS from Vercel until you add an IP here."
+          />
+        )}
+      </section>
+    </section>
+  );
+}
+
 function SettingsView({ state }: { state: AppState }) {
   const duplicateEmployeeCodes = state.workers.length - new Set(state.workers.map((worker) => worker.employeeCode)).size;
   const duplicateAssignments =
     state.assignments.length -
     new Set(state.assignments.map((assignment) => `${assignment.workerId}:${assignment.date}`)).size;
+  const networkDebug = useClockNetworkDebug();
 
   return (
     <section className="grid gap-4">
+      <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <h2 className="text-lg font-bold">Admin Network Debug</h2>
+            <p className="mt-1 text-sm text-slate-500">
+              Use this to compare the live detected IP with the Vercel CLOCK_ALLOWED_IPS list.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={networkDebug.refresh}
+            className="h-10 rounded-md border border-cyan-700 px-4 text-sm font-bold text-cyan-800"
+          >
+            {networkDebug.isLoading ? "Checking..." : "Refresh"}
+          </button>
+        </div>
+        {networkDebug.debug ? (
+          <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            <SummaryCard label="Detected IP" value={networkDebug.debug.detectedIp ?? "Not detected"} />
+            <SummaryCard
+              label="Clock access"
+              value={networkDebug.debug.clockAccess === "allowed" ? "Allowed" : "Blocked"}
+            />
+            <SummaryCard
+              label="Allowed IPs"
+              value={networkDebug.debug.allowedIps.length ? networkDebug.debug.allowedIps.join(", ") : "None loaded"}
+            />
+            <SummaryCard
+              label="cf-connecting-ip"
+              value={networkDebug.debug.headers["cf-connecting-ip"] ?? "Not set"}
+            />
+            <SummaryCard
+              label="x-real-ip"
+              value={networkDebug.debug.headers["x-real-ip"] ?? "Not set"}
+            />
+            <SummaryCard
+              label="x-forwarded-for"
+              value={networkDebug.debug.headers["x-forwarded-for"] ?? "Not set"}
+            />
+          </div>
+        ) : (
+          <p className="mt-4 rounded-md bg-slate-50 p-3 text-sm text-slate-500">
+            Network debug data is loading.
+          </p>
+        )}
+      </section>
+
       <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
         <h2 className="text-lg font-bold">Supabase migration utility</h2>
         <p className="mt-1 text-sm text-slate-500">
@@ -1970,18 +2268,20 @@ function WorkerClockPanel({
   clockLogs,
   selectedDate,
   todayAssignment,
+  allowedClockIps,
   onWorkerClock,
 }: {
   worker: Worker;
   clockLogs: ClockLog[];
   selectedDate: string;
   todayAssignment?: StaffingAssignment;
+  allowedClockIps: string[];
   onWorkerClock: (workerId: string, type: ClockLogType, actionDate: string) => Promise<string>;
 }) {
   const today = getTodayIso();
   const isTodaySelected = selectedDate === today;
   const isScheduledToday = Boolean(todayAssignment);
-  const permission = useClockPermission();
+  const permission = useClockPermission(allowedClockIps);
   const activeSession = getActiveClockSession(clockLogs, worker.id, today);
   const clockedOutToday = hasClockedOutToday(clockLogs, worker.id, today);
   const workedMinutes = calculateWorkedMinutes(clockLogs, worker.id, today);
@@ -2113,6 +2413,7 @@ function WorkerView({
   );
   const selectedSectorId = selectedAssignment?.sectorId ?? worker.sectorId;
   const sector = state.sectors.find((item) => item.id === selectedSectorId);
+  const activeAllowedClockIps = getActiveAllowedClockIps(state.allowedClockIps);
 
   return (
     <section className="grid gap-4">
@@ -2121,6 +2422,7 @@ function WorkerView({
         clockLogs={state.clockLogs}
         selectedDate={selectedDate}
         todayAssignment={todayAssignment}
+        allowedClockIps={activeAllowedClockIps}
         onWorkerClock={onWorkerClock}
       />
 
@@ -2511,7 +2813,9 @@ export default function Home() {
         actionDate,
         role: "worker",
         workerExists: Boolean(worker),
+        workerActive: worker.active,
         isScheduledToday,
+        allowedClockIps: getActiveAllowedClockIps(state.allowedClockIps),
       }),
     });
     const data = await response.json();
@@ -2635,6 +2939,60 @@ export default function Home() {
     });
   }
 
+  function addAllowedClockIp(ipAddress: string, locationName: string) {
+    const cleanIp = ipAddress.trim();
+    const cleanLocationName = locationName.trim();
+
+    if (!cleanIp || !cleanLocationName) {
+      window.alert("IP Address and Location name are required.");
+      return false;
+    }
+
+    if (state.allowedClockIps.some((item) => item.ipAddress === cleanIp)) {
+      window.alert("This IP address already exists.");
+      return false;
+    }
+
+    setState((current) => ({
+      ...current,
+      allowedClockIps: [
+        ...current.allowedClockIps,
+        {
+          id: `allowed-ip-${Date.now()}`,
+          ipAddress: cleanIp,
+          locationName: cleanLocationName,
+          isActive: true,
+          createdAt: new Date().toISOString(),
+          createdBy: account?.username ?? "admin",
+        },
+      ],
+    }));
+
+    return true;
+  }
+
+  function toggleAllowedClockIp(id: string) {
+    setState((current) => ({
+      ...current,
+      allowedClockIps: current.allowedClockIps.map((item) =>
+        item.id === id ? { ...item, isActive: !item.isActive } : item,
+      ),
+    }));
+  }
+
+  function deleteAllowedClockIp(id: string) {
+    const confirmed = window.confirm("Delete this allowed IP?");
+
+    if (!confirmed) {
+      return;
+    }
+
+    setState((current) => ({
+      ...current,
+      allowedClockIps: current.allowedClockIps.filter((item) => item.id !== id),
+    }));
+  }
+
   if (!mounted) {
     return <main className="min-h-screen bg-slate-50" />;
   }
@@ -2706,6 +3064,16 @@ export default function Home() {
 
         {account.role === "admin" && activeTab === "hours" ? (
           <HoursView state={state} onUpdateDayClockLogs={updateDayClockLogs} />
+        ) : null}
+
+        {account.role === "admin" && activeTab === "clock-network" ? (
+          <ClockNetworkView
+            allowedClockIps={state.allowedClockIps}
+            createdBy={account.username}
+            onAddAllowedIp={addAllowedClockIp}
+            onToggleAllowedIp={toggleAllowedClockIp}
+            onDeleteAllowedIp={deleteAllowedClockIp}
+          />
         ) : null}
 
         {account.role === "admin" && activeTab === "settings" ? (

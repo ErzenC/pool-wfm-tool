@@ -7,7 +7,9 @@ type ClockActionRequest = {
   actionDate?: string;
   role?: "worker" | "admin";
   workerExists?: boolean;
+  workerActive?: boolean;
   isScheduledToday?: boolean;
+  allowedClockIps?: string[];
 };
 
 function getBusinessTodayIso() {
@@ -28,6 +30,10 @@ export async function POST(request: Request) {
 
   if (body.workerExists === false) {
     return NextResponse.json({ error: "Worker not found." }, { status: 404 });
+  }
+
+  if (body.workerActive === false) {
+    return NextResponse.json({ error: "Inactive workers cannot clock in or out." }, { status: 403 });
   }
 
   if (body.role !== "worker") {
@@ -53,7 +59,7 @@ export async function POST(request: Request) {
 
   const detectedIp = getRequestIp(request);
 
-  if (!detectedIp || !canWorkerClockFromIp(detectedIp)) {
+  if (!detectedIp || !canWorkerClockFromIp(detectedIp, body.allowedClockIps ?? [])) {
     return NextResponse.json(
       {
         error: "Clock In/Out is available only from authorized Aqua Park networks.",
