@@ -671,6 +671,7 @@ function EmptyState({ title, text }: { title: string; text: string }) {
 function LoginScreen({ onLogin }: { onLogin: (username: string, password: string) => Promise<string> }) {
   const [username, setUsername] = useState("admin@poolwfm.local");
   const [password, setPassword] = useState("admin123");
+  const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState(() => {
     if (typeof window === "undefined") {
       return "";
@@ -718,12 +719,22 @@ function LoginScreen({ onLogin }: { onLogin: (username: string, password: string
           </label>
           <label className="flex flex-col gap-2 text-sm font-semibold text-slate-700">
             Password
-            <input
-              type="password"
-              value={password}
-              onChange={(event) => setPassword(event.target.value)}
-              className="h-11 rounded-md border border-slate-300 px-3 text-base outline-none focus:border-cyan-700 focus:ring-2 focus:ring-cyan-100"
-            />
+            <span className="flex h-11 items-center rounded-md border border-slate-300 bg-white focus-within:border-cyan-700 focus-within:ring-2 focus-within:ring-cyan-100">
+              <input
+                type={showPassword ? "text" : "password"}
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                className="h-full min-w-0 flex-1 rounded-md px-3 text-base outline-none"
+              />
+              <button
+                type="button"
+                onClick={() => setShowPassword((current) => !current)}
+                className="h-full px-3 text-sm font-bold text-cyan-800"
+                aria-label={showPassword ? "Hide password" : "Show password"}
+              >
+                {showPassword ? "Hide" : "Show"}
+              </button>
+            </span>
           </label>
           {error ? <p className="rounded-md bg-rose-50 p-3 text-sm text-rose-700">{error}</p> : null}
           <button
