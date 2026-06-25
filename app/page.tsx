@@ -58,16 +58,6 @@ type ClockLog = {
   ipAddress: string | null;
 };
 
-type ManualHourAdjustment = {
-  id: string;
-  workerId: string;
-  dateFrom: string;
-  dateTo: string;
-  totalMinutes: number;
-  updatedAt: string;
-  updatedBy: string;
-};
-
 type WorkerForm = Omit<Worker, "id"> & {
   temporaryPassword: string;
 };
@@ -93,7 +83,6 @@ type AppState = {
   selectedCity: string;
   assignments: Assignments;
   clockLogs: ClockLog[];
-  manualHourAdjustments: ManualHourAdjustment[];
 };
 
 const STORAGE_KEY = "pool-wfm-state-v3";
@@ -175,7 +164,6 @@ const initialState: AppState = {
     { id: "a-06", date: getNextFiveDays()[1], sectorId: "restaurant", workerId: "w-15", shift: 2 },
   ],
   clockLogs: [],
-  manualHourAdjustments: [],
 };
 
 function getTodayIso() {
@@ -292,6 +280,10 @@ function hasClockedOutToday(clockLogs: ClockLog[], workerId: string, date: strin
   return getWorkerDayLogs(clockLogs, workerId, date).some((log) => log.type === "CLOCK_OUT");
 }
 
+function hasMissingClockOut(clockLogs: ClockLog[], workerId: string, date: string) {
+  return date < getTodayIso() && getWorkerDayLogs(clockLogs, workerId, date).at(-1)?.type === "CLOCK_IN";
+}
+
 function calculateWorkedMinutes(clockLogs: ClockLog[], workerId: string, date: string) {
   const logs = getWorkerDayLogs(clockLogs, workerId, date);
   let openClockIn: ClockLog | undefined;
@@ -312,7 +304,7 @@ function calculateWorkedMinutes(clockLogs: ClockLog[], workerId: string, date: s
     }
   });
 
-  if (openClockIn) {
+  if (openClockIn && date === getTodayIso()) {
     total += Math.max(
       0,
       Math.round((Date.now() - new Date(openClockIn.timestamp).getTime()) / 60000),
@@ -329,31 +321,8 @@ function calculateWorkerRangeMinutes(clockLogs: ClockLog[], workerId: string, da
   );
 }
 
-function getManualHourAdjustment(
-  adjustments: ManualHourAdjustment[],
-  workerId: string,
-  dateFrom: string,
-  dateTo: string,
-) {
-  return adjustments.find(
-    (adjustment) =>
-      adjustment.workerId === workerId &&
-      adjustment.dateFrom === dateFrom &&
-      adjustment.dateTo === dateTo,
-  );
-}
-
-function calculatePayrollMinutes(
-  clockLogs: ClockLog[],
-  adjustments: ManualHourAdjustment[],
-  workerId: string,
-  dateFrom: string,
-  dateTo: string,
-) {
-  return (
-    getManualHourAdjustment(adjustments, workerId, dateFrom, dateTo)?.totalMinutes ??
-    calculateWorkerRangeMinutes(clockLogs, workerId, dateFrom, dateTo)
-  );
+function buildClockTimestamp(date: string, time: string) {
+  return new Date(`${date}T${time}:00`).toISOString();
 }
 
 function loadJson<T>(key: string, fallback: T): T {
@@ -449,7 +418,6 @@ function migrateAppState(saved: AppState): AppState {
     selectedCity: saved.selectedCity ?? initialState.selectedCity,
     assignments: migrateAssignments(saved.assignments),
     clockLogs: saved.clockLogs ?? initialState.clockLogs,
-    manualHourAdjustments: saved.manualHourAdjustments ?? initialState.manualHourAdjustments,
   };
 }
 
@@ -1732,45 +1700,54 @@ function SettingsView({ state }: { state: AppState }) {
 
 function HoursView({
   state,
-  onSetManualHours,
+  onUpdateDayClockLogs,
 }: {
   state: AppState;
-  onSetManualHours: (workerId: string, dateFrom: string, dateTo: string, totalHours: number) => void;
+  onUpdateDayClockLogs: (workerId: string, date: string, clockInTime: string, clockOutTime: string) => void;
 }) {
   const [workerFilter, setWorkerFilter] = useState("all");
   const [sectorFilter, setSectorFilter] = useState("all");
   const [dateFrom, setDateFrom] = useState(getTodayIso());
   const [dateTo, setDateTo] = useState(getTodayIso());
-  const [draftHours, setDraftHours] = useState<Record<string, string>>({});
+  const [editingWorkerId, setEditingWorkerId] = useState<string | null>(null);
+  const [clockInDraft, setClockInDraft] = useState("");
+  const [clockOutDraft, setClockOutDraft] = useState("");
 
   const filteredWorkers = state.workers.filter(
     (worker) =>
       (workerFilter === "all" || worker.id === workerFilter) &&
       (sectorFilter === "all" || worker.sectorId === sectorFilter),
   );
+  const isSingleDate = dateFrom === dateTo;
   const payrollRows = filteredWorkers.map((worker) => {
     const loggedMinutes = calculateWorkerRangeMinutes(state.clockLogs, worker.id, dateFrom, dateTo);
-    const manualAdjustment = getManualHourAdjustment(
-      state.manualHourAdjustments,
-      worker.id,
-      dateFrom,
-      dateTo,
+    const missingClockOutDates = getDatesInRange(dateFrom, dateTo).filter((date) =>
+      hasMissingClockOut(state.clockLogs, worker.id, date),
     );
-    const totalMinutes = calculatePayrollMinutes(
-      state.clockLogs,
-      state.manualHourAdjustments,
-      worker.id,
-      dateFrom,
-      dateTo,
-    );
+    const isClockedInToday =
+      isSingleDate &&
+      dateFrom === getTodayIso() &&
+      Boolean(getActiveClockSession(state.clockLogs, worker.id, dateFrom));
 
     return {
       worker,
       loggedMinutes,
-      totalMinutes,
-      isAdjusted: Boolean(manualAdjustment),
+      totalMinutes: loggedMinutes,
+      missingClockOutDates,
+      isMissingClockOut: missingClockOutDates.length > 0,
+      isClockedInToday,
     };
   });
+
+  function openEdit(workerId: string) {
+    const logs = getWorkerDayLogs(state.clockLogs, workerId, dateFrom);
+    const clockIn = logs.find((log) => log.type === "CLOCK_IN");
+    const clockOut = logs.findLast((log) => log.type === "CLOCK_OUT");
+
+    setEditingWorkerId(workerId);
+    setClockInDraft(clockIn ? new Date(clockIn.timestamp).toTimeString().slice(0, 5) : "");
+    setClockOutDraft(clockOut ? new Date(clockOut.timestamp).toTimeString().slice(0, 5) : "");
+  }
 
   function exportCsv() {
     const rows = [
@@ -1850,64 +1827,129 @@ function HoursView({
         </div>
         {payrollRows.length ? (
           <ul className="mt-4 grid gap-2">
-            {payrollRows.map(({ worker, loggedMinutes, totalMinutes, isAdjusted }) => {
-              const draftKey = `${worker.id}:${dateFrom}:${dateTo}`;
-              const draftValue = draftHours[draftKey] ?? (totalMinutes / 60).toFixed(2);
-
-              return (
-                <li key={worker.id} className="rounded-lg border border-slate-200 p-3">
-                  <div className="grid gap-3 md:grid-cols-[1fr_220px_120px] md:items-end">
+            {payrollRows.map(({ worker, loggedMinutes, totalMinutes, isMissingClockOut, missingClockOutDates, isClockedInToday }) => (
+                <li
+                  key={worker.id}
+                  className={`rounded-lg border p-3 ${
+                    isMissingClockOut
+                      ? "border-rose-200 bg-rose-50"
+                      : "border-slate-200 bg-white"
+                  }`}
+                >
+                  <div className="grid gap-3 md:grid-cols-[1fr_140px_140px_160px_120px] md:items-center">
                     <div>
                       <p className="text-sm font-bold">{getWorkerDisplayName(worker)}</p>
                       <p className="text-xs text-slate-500">
                         {worker.employeeCode} - {getSectorName(state.sectors, worker.sectorId)}
                       </p>
-                      <p className="mt-1 text-xs text-slate-500">
-                        Logged: {formatDuration(loggedMinutes)}
-                        {isAdjusted ? " - adjusted by admin" : ""}
-                      </p>
+                      {isMissingClockOut ? (
+                        <p className="mt-2 text-xs text-rose-700">
+                          Worker clocked in but did not clock out.
+                        </p>
+                      ) : null}
                     </div>
-                    <label className="flex flex-col gap-2 text-sm font-semibold text-slate-700">
-                      Total hours
-                      <input
-                        type="number"
-                        min="0"
-                        step="0.01"
-                        value={draftValue}
-                        onChange={(event) =>
-                          setDraftHours((current) => ({
-                            ...current,
-                            [draftKey]: event.target.value,
-                          }))
-                        }
-                        className="h-11 rounded-md border border-slate-300 px-3 text-base outline-none focus:border-cyan-700"
-                      />
-                    </label>
+                    <div>
+                      <p className="text-xs font-semibold uppercase tracking-[0.12em] text-slate-500">Logged hours</p>
+                      <p className="mt-1 text-sm font-bold text-slate-800">{formatDuration(loggedMinutes)}</p>
+                    </div>
+                    <div>
+                      <p className="text-xs font-semibold uppercase tracking-[0.12em] text-slate-500">Total hours</p>
+                      <p className="mt-1 text-sm font-bold text-cyan-800">{formatDuration(totalMinutes)}</p>
+                    </div>
+                    <div className="grid gap-2">
+                      <span
+                        className={`w-fit rounded-full px-3 py-1 text-xs font-bold ${
+                          isMissingClockOut
+                            ? "bg-rose-100 text-rose-700"
+                            : isClockedInToday
+                              ? "bg-cyan-100 text-cyan-800"
+                              : totalMinutes > 0
+                                ? "bg-emerald-100 text-emerald-700"
+                                : "bg-slate-100 text-slate-600"
+                        }`}
+                      >
+                        {isMissingClockOut
+                          ? "Missing Clock Out"
+                          : isClockedInToday
+                            ? "Clocked In"
+                            : totalMinutes > 0
+                              ? "Complete"
+                              : "No hours"}
+                      </span>
+                      {missingClockOutDates.length > 1 ? (
+                        <span className="text-xs text-rose-700">
+                          {missingClockOutDates.length} dates need fixing.
+                        </span>
+                      ) : null}
+                    </div>
                     <button
                       type="button"
                       onClick={() => {
-                        const nextHours = Number(draftValue);
-
-                        if (Number.isNaN(nextHours) || nextHours < 0) {
-                          window.alert("Enter a valid total hours number.");
+                        if (!isSingleDate) {
+                          window.alert("Set From and To to the same date before editing clock times.");
                           return;
                         }
 
-                        onSetManualHours(worker.id, dateFrom, dateTo, nextHours);
+                        openEdit(worker.id);
                       }}
-                      className="h-11 rounded-md bg-cyan-700 px-4 text-sm font-bold text-white"
+                      className="h-11 rounded-md border border-cyan-700 px-4 text-sm font-bold text-cyan-800"
                     >
-                      Save
+                      Edit
                     </button>
                   </div>
                 </li>
-              );
-            })}
+              ))}
           </ul>
         ) : (
           <EmptyState title="No workers in filter" text="Choose another worker or sector filter." />
         )}
       </section>
+
+      {editingWorkerId ? (
+        <section className="rounded-lg border border-cyan-200 bg-cyan-50 p-4 shadow-sm">
+          <h2 className="text-lg font-bold">Edit clock times</h2>
+          <p className="mt-1 text-sm text-slate-600">
+            {getWorkerDisplayName(state.workers.find((worker) => worker.id === editingWorkerId) as Worker)} - {dateFrom}
+          </p>
+          <div className="mt-4 grid gap-3 sm:grid-cols-[1fr_1fr_120px_120px] sm:items-end">
+            <label className="flex flex-col gap-2 text-sm font-semibold text-slate-700">
+              Clock In
+              <input
+                type="time"
+                value={clockInDraft}
+                onChange={(event) => setClockInDraft(event.target.value)}
+                className="h-11 rounded-md border border-slate-300 px-3 text-base outline-none focus:border-cyan-700"
+              />
+            </label>
+            <label className="flex flex-col gap-2 text-sm font-semibold text-slate-700">
+              Clock Out
+              <input
+                type="time"
+                value={clockOutDraft}
+                onChange={(event) => setClockOutDraft(event.target.value)}
+                className="h-11 rounded-md border border-slate-300 px-3 text-base outline-none focus:border-cyan-700"
+              />
+            </label>
+            <button
+              type="button"
+              onClick={() => {
+                onUpdateDayClockLogs(editingWorkerId, dateFrom, clockInDraft, clockOutDraft);
+                setEditingWorkerId(null);
+              }}
+              className="h-11 rounded-md bg-cyan-700 px-4 text-sm font-bold text-white"
+            >
+              Save
+            </button>
+            <button
+              type="button"
+              onClick={() => setEditingWorkerId(null)}
+              className="h-11 rounded-md border border-slate-300 px-4 text-sm font-bold text-slate-700"
+            >
+              Cancel
+            </button>
+          </div>
+        </section>
+      ) : null}
 
       <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
         <h2 className="text-lg font-bold">CSV columns</h2>
@@ -2541,33 +2583,54 @@ export default function Home() {
     }));
   }
 
-  function setManualHours(workerId: string, dateFrom: string, dateTo: string, totalHours: number) {
-    const totalMinutes = Math.round(totalHours * 60);
+  function updateDayClockLogs(workerId: string, date: string, clockInTime: string, clockOutTime: string) {
+    if (!clockInTime) {
+      window.alert("Clock In time is required.");
+      return;
+    }
+
+    if (clockOutTime && clockOutTime <= clockInTime) {
+      window.alert("Clock Out must be later than Clock In.");
+      return;
+    }
 
     setState((current) => {
-      const existingAdjustment = getManualHourAdjustment(
-        current.manualHourAdjustments,
-        workerId,
-        dateFrom,
-        dateTo,
-      );
-      const nextAdjustment: ManualHourAdjustment = {
-        id: existingAdjustment?.id ?? `manual-hours-${Date.now()}-${workerId}`,
-        workerId,
-        dateFrom,
-        dateTo,
-        totalMinutes,
-        updatedAt: new Date().toISOString(),
-        updatedBy: account?.username ?? "admin",
-      };
+      const nextLogs: ClockLog[] = [
+        {
+          id: `admin-edit-in-${Date.now()}-${workerId}`,
+          workerId,
+          type: "CLOCK_IN",
+          timestamp: buildClockTimestamp(date, clockInTime),
+          date,
+          createdBy: account?.username ?? "admin",
+          source: "ADMIN_OVERRIDE",
+          note: "Clock In corrected manually by admin",
+          ipAddress: null,
+        },
+      ];
+
+      if (clockOutTime) {
+        nextLogs.push({
+          id: `admin-edit-out-${Date.now()}-${workerId}`,
+          workerId,
+          type: "CLOCK_OUT",
+          timestamp: buildClockTimestamp(date, clockOutTime),
+          date,
+          createdBy: account?.username ?? "admin",
+          source: "ADMIN_OVERRIDE",
+          note: "Clock Out corrected manually by admin",
+          ipAddress: null,
+        });
+      }
 
       return {
         ...current,
-        manualHourAdjustments: existingAdjustment
-          ? current.manualHourAdjustments.map((adjustment) =>
-              adjustment.id === existingAdjustment.id ? nextAdjustment : adjustment,
-            )
-          : [...current.manualHourAdjustments, nextAdjustment],
+        clockLogs: [
+          ...current.clockLogs.filter(
+            (log) => !(log.workerId === workerId && log.date === date),
+          ),
+          ...nextLogs,
+        ].sort((a, b) => a.timestamp.localeCompare(b.timestamp)),
       };
     });
   }
@@ -2642,7 +2705,7 @@ export default function Home() {
         ) : null}
 
         {account.role === "admin" && activeTab === "hours" ? (
-          <HoursView state={state} onSetManualHours={setManualHours} />
+          <HoursView state={state} onUpdateDayClockLogs={updateDayClockLogs} />
         ) : null}
 
         {account.role === "admin" && activeTab === "settings" ? (
